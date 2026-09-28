@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from app.config.database import get_db
 from app.core.dependencies import get_current_user, CurrentUser
 from app.core.rate_limit import rate_limit
+from app.models.app_role import AppRole
 from app.models.organisation import Organisation
 from app.models.organisation_invite import OrganisationInvite
 from app.models.user import User
@@ -28,6 +29,13 @@ def _validate_upload(file: UploadFile, content: bytes) -> None:
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail="File exceeds the 50 MB limit",
         )
+
+
+def _is_superadmin(user: User, db: Session) -> bool:
+    if not user.app_role_id:
+        return False
+    role = db.query(AppRole).filter(AppRole.id == user.app_role_id).first()
+    return bool(role and role.name == "superadmin")
 
 
 def _require_pending_invite(email: str, db: Session) -> OrganisationInvite:
@@ -94,16 +102,30 @@ def check_setup_required(
         )
         .first()
     )
-    if not invite:
+    user = db.query(User).filter(User.email == email).first()
+    # A linked admin is done, even if a stale pending invite is still on file.
+    if user and user.organisation_id is not None:
+        if invite:
+            invite.status = "accepted"
+            db.commit()
+            logger.info("Auto-accepted stale invite for %s (org_id=%s)", email, user.organisation_id)
         return {"needs_setup": False}
 
-    # If the user already has an organisation_id, they completed setup already.
-    # Auto-accept the stale invite so they never see the wizard again.
-    user = db.query(User).filter(User.email == email).first()
-    if user and user.organisation_id is not None:
-        invite.status = "accepted"
-        db.commit()
-        logger.info("Auto-accepted stale invite for %s (org_id=%s)", email, user.organisation_id)
+    # Superadmin is platform-scoped and has no organisation on purpose.
+    # Every other login with an empty organisation_id must finish the wizard
+    # before Data Management will accept a site, department, or hazard.
+    # This stays true after the invite is no longer "pending" — accepting the
+    # invite without step 1 used to drop the admin on the dashboard, and the
+    # next save then wrote organisation_id=-1.
+    if user and user.organisation_id is None and not _is_superadmin(user, db):
+        return {
+            "needs_setup": True,
+            "organisation_name": invite.organisation_name if invite else None,
+            "admin_name": (invite.admin_name if invite else None) or user.full_name,
+            "invite_id": invite.id if invite else None,
+        }
+
+    if not invite:
         return {"needs_setup": False}
 
     return {

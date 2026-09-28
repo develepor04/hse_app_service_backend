@@ -5,6 +5,7 @@ Subclasses declare  model_class = MyModel  and call __init__(db) only.
 
 from typing import Generic, TypeVar, Optional, Type, ClassVar, List, Dict
 from sqlalchemy.orm import Session
+from app.core.exceptions import ValidationError
 from app.repositories.interface import IRepository
 
 T = TypeVar("T")
@@ -55,6 +56,15 @@ class BaseRepository(IRepository[T], Generic[T]):
         )
 
     def create(self, data: dict) -> T:
+        # get_current_user uses -1 when the login has no organisation, so list
+        # queries stay empty. Writing that sentinel hits fk_sites_org (and the
+        # same constraint on every other tenant table) and surfaces as a 500.
+        org_id = data.get("organisation_id")
+        if org_id is not None and org_id < 1:
+            raise ValidationError(
+                "Your account is not linked to an organisation yet. "
+                "Finish organisation setup before adding records."
+            )
         obj = self.model_class(**data)
         self._db.add(obj)
         self._db.flush()
